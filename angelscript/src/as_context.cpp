@@ -262,6 +262,8 @@ void *asCContext::GetUserData() const
 	return userData;
 }
 
+#ifdef AS_DEPRECATED
+// Deprecated since 2.24.0 - 2012-05-25
 // interface
 int asCContext::Prepare(int funcId)
 {
@@ -274,6 +276,7 @@ int asCContext::Prepare(int funcId)
 	}
 	return Prepare(engine->GetFunctionById(funcId));
 }
+#endif
 
 // interface
 asIScriptFunction *asCContext::GetSystemFunction()
@@ -355,6 +358,9 @@ int asCContext::Prepare(asIScriptFunction *func)
 			stackBlockSize = stackSize;
 
 			asDWORD *stack = asNEWARRAY(asDWORD,stackBlockSize);
+			if( stack == 0 )
+				return asOUT_OF_MEMORY;
+
 			stackBlocks.PushLast(stack);
 		}
 	}
@@ -1243,7 +1249,6 @@ void asCContext::CallScriptFunction(asCScriptFunction *func)
 					// Set the stackFramePointer, even though the stackPointer wasn't updated
 					regs.stackFramePointer = regs.stackPointer;
 
-					// TODO: Make sure the exception handler doesn't try to free objects that have not been initialized
 					SetInternalException(TXT_STACK_OVERFLOW);
 					return;
 				}
@@ -1253,6 +1258,17 @@ void asCContext::CallScriptFunction(asCScriptFunction *func)
 			if( (int)stackBlocks.GetLength() == stackIndex )
 			{
 				asDWORD *stack = asNEWARRAY(asDWORD,(stackBlockSize << stackIndex));
+				if( stack == 0 )
+				{
+					// Out of memory
+					isStackMemoryNotAllocated = true;
+
+					// Set the stackFramePointer, even though the stackPointer wasn't updated
+					regs.stackFramePointer = regs.stackPointer;
+
+					SetInternalException(TXT_STACK_OVERFLOW);
+					return;
+				}
 				stackBlocks.PushLast(stack);
 			}
 
@@ -3686,6 +3702,11 @@ void asCContext::CleanStack()
 	// Run the clean up code for each of the functions called
 	CleanStackFrame();
 
+	// Set the status to exception so that the stack unwind is done correctly.
+	// This shouldn't be done for the current function, which is why we only 
+	// do this after the first CleanStackFrame() is done.
+	status = asEXECUTION_EXCEPTION;
+
 	while( callStack.GetLength() > 0 )
 	{
 		PopCallState();
@@ -3761,22 +3782,26 @@ void asCContext::DetermineLiveObjects(asCArray<int> &liveObjects, asUINT stackLe
 	{
 		func = currentFunction;
 		pos = asUINT(regs.programPointer - func->byteCode.AddressOf());
+
+		if( status == asEXECUTION_EXCEPTION )
+		{
+			// Don't consider the last instruction as executed, as it failed with an exception
+			// It's not actually necessary to decrease the exact size of the instruction. Just 
+			// before the current position is enough to disconsider it.
+			pos--;
+		}
 	}
 	else
 	{
 		asPWORD *s = callStack.AddressOf() + (GetCallstackSize()-stackLevel-1)*CALLSTACK_FRAME_SIZE;
 		func = (asCScriptFunction*)s[1];
 		pos = asUINT((asDWORD*)s[2] - func->byteCode.AddressOf());
-	}
 
-	if( status == asEXECUTION_EXCEPTION )
-	{
-		// Don't consider the last instruction as executed, as it failed with an exception
-		// It's not actually necessary to decrease the exact size of the instruction. Just 
-		// before the current position is enough to disconsider it.
+		// Don't consider the last instruction as executed, as the function that was called by it
+		// is still being executed. If we consider it as executed already, then a value object 
+		// returned by value would be considered alive, which it is not.
 		pos--;
 	}
-
 
 	// Determine which object variables that are really live ones
 	liveObjects.SetLength(func->objVariablePos.GetLength());
@@ -3851,8 +3876,10 @@ void asCContext::DetermineLiveObjects(asCArray<int> &liveObjects, asUINT stackLe
 
 void asCContext::CleanStackFrame()
 {
-	// Clean object variables
-	if( !isStackMemoryNotAllocated )
+	// Clean object variables on the stack
+	// If the stack memory is not allocated or the program pointer
+	// is not set, then there is nothing to clean up on the stack frame
+	if( !isStackMemoryNotAllocated && regs.programPointer )
 	{
 		// Determine which object variables that are really live ones
 		asCArray<int> liveObjects;
@@ -4236,31 +4263,62 @@ void *asCContext::GetAddressOfVar(asUINT varIndex, asUINT stackLevel)
 		return 0;
 
 	// For object variables it's necessary to dereference the pointer to get the address of the value
-	if( func->variables[varIndex]->type.IsObject() && !func->variables[varIndex]->type.IsObjectHandle() )
+	// Reference parameters must also be dereferenced to give the address of the value
+	int pos = func->variables[varIndex]->stackOffset;
+	if( (func->variables[varIndex]->type.IsObject() && !func->variables[varIndex]->type.IsObjectHandle()) || (pos <= 0) )
 	{
 		// Determine if the object is really on the heap
-		bool onHeap = true;
-		if( func->variables[varIndex]->type.GetObjectType()->GetFlags() & asOBJ_VALUE )
+		bool onHeap = false;
+		if( func->variables[varIndex]->type.IsObject() && 
+			!func->variables[varIndex]->type.IsObjectHandle() )
 		{
-			int pos = func->variables[varIndex]->stackOffset;
-			for( asUINT n = 0; n < func->objVariablePos.GetLength(); n++ )
+			onHeap = true;
+			if( func->variables[varIndex]->type.GetObjectType()->GetFlags() & asOBJ_VALUE )
 			{
-				if( func->objVariablePos[n] == pos )
+				for( asUINT n = 0; n < func->objVariablePos.GetLength(); n++ )
 				{
-					onHeap = n < func->objVariablesOnHeap;
-
-					if( !onHeap )
+					if( func->objVariablePos[n] == pos )
 					{
-						// If the object on the stack is not initialized return a null pointer instead
-						asCArray<int> liveObjects;
-						DetermineLiveObjects(liveObjects, stackLevel);
+						onHeap = n < func->objVariablesOnHeap;
 
-						if( liveObjects[n] <= 0 )
-							return 0;
+						if( !onHeap )
+						{
+							// If the object on the stack is not initialized return a null pointer instead
+							asCArray<int> liveObjects;
+							DetermineLiveObjects(liveObjects, stackLevel);
+
+							if( liveObjects[n] <= 0 )
+								return 0;
+						}
+
+						break;
 					}
+				}
+			}
+		}
+
+		// If it wasn't an object on the heap, then check if it is a reference parameter
+		if( !onHeap && pos <= 0 )
+		{
+			// Determine what function argument this position matches
+			int stackPos = 0;
+			if( func->objectType )
+				stackPos -= AS_PTR_SIZE;
+
+			if( func->DoesReturnOnStack() )
+				stackPos -= AS_PTR_SIZE;
+
+			for( asUINT n = 0; n < func->parameterTypes.GetLength(); n++ )
+			{
+				if( stackPos == pos )
+				{
+					// The right argument was found. Is this a reference parameter?
+					if( func->inOutFlags[n] != asTM_NONE )
+						onHeap = true;
 
 					break;
 				}
+				stackPos -= func->parameterTypes[n].GetSizeOnStackDWords();
 			}
 		}
 
