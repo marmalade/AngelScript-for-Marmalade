@@ -338,7 +338,7 @@ typedef unsigned int   asUINT;
 	// is likely to use MSVC6 to compile for 16bit systems anymore, so this should be ok.
 	typedef size_t	       asPWORD;
 #else
-	typedef uintptr_t      asPWORD;
+	typedef size_t		   asPWORD;
 #endif
 #ifdef __LP64__
     typedef unsigned int  asDWORD;
